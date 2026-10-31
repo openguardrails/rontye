@@ -1,99 +1,84 @@
-# OpenAFW
+# Ron Tye
 
-A local AI firewall for coding agents. Point Claude Code, Codex, Gemini CLI,
-OpenCode, OpenClaw or Hermes at `http://127.0.0.1:4141`; secrets in every
-request are replaced by `OGRKF0000001`-style placeholders before they leave your
-machine and put back when the model's reply comes home. The model, the relay
-and the provider never see the value; your terminal, your tools and your
-files still do.
+**A firewall for the agents your agents spawn.**
 
-Free and open source. Connects to [OpenGuardrails](https://openguardrails.com)
-for the paid features (served rulesets, tool-call judgement, dashboards).
-Design: [`docs/architecture.md`](docs/architecture.md).
+Claude Code and Codex come with guardrails. The opencode, hermes or pi workers they dispatch, running
+a third-party quantization on your own GPU or a model behind a relay, come with none, and you cannot
+see what those workers did. Weights can carry a backdoor that evaluations do not catch, and official
+weights have been seen reaching for places nobody asked them to go:
 
-## Status
+- [How abliterated models can get you pwned](https://projectdiscovery.io/research/how-abliterated-models-can-get-you-pwned)
+- [Concerning behaviour in a popular open-weight model](https://cohere.com/blog/concerning-behaviour-popular-open-weight-ai-model)
 
-Milestone 1 (2026-09-13): pass-through proxy with mask/restore for Anthropic
-Messages, OpenAI Chat Completions and OpenAI Responses, streaming included.
-Verified live with Claude Code: the model saw a 12-character placeholder, the
-shell measured the 44-character key.
-
-Also in: encrypted key vault with profiles and per-agent local tokens, a
-persisted placeholder map, `openafw protect claude|codex|gemini|opencode|openclaw|hermes` (with byte-exact `unprotect`), a loopback `POST /__afw/api/mask` for local plugins (mint only, never reveal), a Gemini
-decoder, a status page at `http://127.0.0.1:4141/__afw/`, and an OpenGuardrails
-connection (`openafw connect`) for served rulesets and per-step verdicts
-(`step/request` / `step/response`; observe by default, `--ogr-enforce` to refuse blocked steps). The placeholder
-shape, and the minter letter that namespaces it, were chosen by measurement: `docs/placeholder-experiment.md`.
-
-## Try it
+`rontye run` starts a command in an OS sandbox. Its whole process tree, every subagent and script
+included, can only reach the network through Ron, and cannot read your credential files.
 
 ```sh
-cargo build --release
-./target/release/openafw                    # 127.0.0.1:4141 → https://api.anthropic.com
-ANTHROPIC_BASE_URL=http://127.0.0.1:4141 claude
+npm install && npm run build
+node dist/src/cli.js run -- claude
+node dist/src/cli.js log
 ```
 
-```sh
-openafw profile add anthropic --provider anthropic --key-stdin   # paste the key, Enter
-openafw agent set claude anthropic                                # mints claude's local token
-openafw protect claude --profile anthropic                        # writes ~/.claude/settings.json
-openafw status
+```
+14:10:05 model    opencode -> 127.0.0.1 qwen3.8-27b-q4 (openai.chat)
+14:10:05 tool     shell  names example.org
+14:10:06 FINDING  undeclared destination example.com: POST x1, 6B up, no tool call named it
 ```
 
-`openafw --help` lists the rest: `--listen`, `--upstream`, `--upstream-key`,
-`--rules`, `--strong-only`, `--hint`; `profile`, `agent`, `protect`, `unprotect`,
-`connect`, `disconnect`, `forget-map`. Vault at `~/.openafw/vault.bin`
-(AES-256-GCM; master key in `~/.openafw/master.key`, 0600). Logs never contain values.
+A model that fetches a script from a trusted host and uploads your keys somewhere else passes any
+allowlist. The signal is the gap between where the tool calls said they were going and where the
+process tree actually went.
 
-## See the leak, and see it stop
+## What it does
 
-The common leak is not the user pasting a key: it is the agent reading a
-file that happens to contain one, after which the whole file content is
-resent to the provider on every turn. `--tap DIR` writes every provider-bound
-body so you can check for yourself; `--mask false` shows the baseline.
+| | |
+|---|---|
+| **Network** | Every connection goes through a local proxy that terminates TLS. Direct connections fail, even with `curl --noproxy '*'`. Cloud metadata and loopback addresses are refused unless you allow them. |
+| **Files** | `~/.ssh`, `~/.aws`, `.env` and other credential locations cannot be read. Writes are limited to the project, temp and agent state directories. |
+| **Model calls** | Recognised by path on any host, so a local vLLM, OpenRouter and a relay all count. Records which agent called which model on which host. |
+| **Said vs did** | Compares the destinations named in tool calls with the connections actually made. |
+| **Modes** | Network is observed by default. `--enforce` denies every host you did not allow. File rules always apply. |
 
-```
-# .env holds STRIPE_SECRET_KEY=sk_live_…; ask Claude Code to fix a malformed line in it
-openafw --mask false --tap /tmp/tap-off     # baseline: 2 of 5 provider-bound bodies contain the real key
-openafw --tap /tmp/tap-on                   # firewall: 0 of 4 contain it; 2 contain OGRKF0000001 instead
-```
+A local model needs its address allowed: `rontye run --allow-host 127.0.0.1:8000 -- opencode`.
 
-Locally the file is fixed and still holds the real key, and the answer shown
-in the terminal is restored — only the provider never sees the value.
+The record is in `~/.rontye/runs/`, mode 0600. It holds destinations and tool names, and never a
+body, a query string, a tool argument or a long path segment.
 
-## Run it at login, or as a desktop app
+With `OGR_API_KEY` set, each model request also goes to [OpenGuardrails AIRS](https://openguardrails.com)
+for judging. That sends the request body as it is, secrets included, and it only records: a verdict
+stops nothing yet.
 
-```sh
-openafw service install     # launchd (macOS) / systemd --user (Linux) / Task Scheduler (Windows)
-openafw service status
-openafw service uninstall   # removes exactly what install wrote
-```
+## What it does not do yet
 
-`crates/openafw-desktop` is the Tauri shell: a menu-bar/tray icon
-(open / pause / start at login / quit) and a window showing the same status
-page, with the daemon in-process. If a service is already listening it
-attaches instead of starting a second one. Build the installers with
-`scripts/build-desktop.sh` (macOS `.app` + `.dmg`, Windows `.msi`, Linux
-`.deb` + AppImage). macOS and Windows are the primary targets; the Linux
-build works but the CLI plus the systemd user service is the primary
-Linux path.
+- **It cannot read a model's reply.** The proxy hook exposes a reply's status and headers only. Tool
+  calls are read from the next request's history, so they are seen after they ran, and nothing can
+  stop a tool call before it runs.
+- **Claude Code 2.1 does not resend its history.** Its calls are invisible, so a run containing it
+  reports `UNVERIFIED` instead of `FINDING`. A run in which every client resends history, as
+  stateless chat completion clients must, is not affected.
+- **Connections are attributed to the run, not to an agent.** Each model call is labelled from its
+  User-Agent, which a process can fake. Which subagent opened which connection is unknown.
+- **No secret masking, and no live or web view.** `rontye log` prints a finished or running record.
+- **Not nested in another sandbox.** macOS refuses to nest `sandbox-exec`, so a harness's own sandbox
+  cannot start inside Ron.
 
-From the page you can protect an agent with one click — it writes that
-agent's own config and keeps a byte-exact backup, the same as
-`openafw protect`.
+Denied file reads are recorded on macOS. On Linux they fail for the process and leave no record.
 
-## Layout
+## What it is built on
 
-- `crates/afw-engine` — the OGR 1.4 local-redaction engine: ruleset compile +
-  self-verification, `reject_value` predicates, session map, mask, restore,
-  SSE rewriting. `cargo test -p afw-engine` runs the OGR conformance corpus.
-- `crates/openafw` — the daemon as a library plus the CLI.
-- `crates/openafw-desktop` — the Tauri desktop shell (tray + window).
-- `rules/builtin-secrets.json` — the bundled ruleset (AIRS built-ins, wire shape).
-- `rules/conformance/` — the OGR local-redaction conformance corpus.
+[`@anthropic-ai/sandbox-runtime`](https://github.com/anthropics/sandbox-runtime) does the enforcing:
+Seatbelt on macOS, bubblewrap and seccomp on Linux. It is a beta, so the version is pinned. Windows
+is untested here. Its stated limits apply, including domain fronting. Linux needs `bubblewrap`,
+`socat` and `ripgrep`, and macOS needs `ripgrep`. Node 22.12 or newer is required.
+
+The credential list is a starting point, not a boundary: a key stored at an unlisted path stays
+readable.
+
+## History
+
+This repository used to be OpenAFW. That code remains in the git history and under the tags up to
+`v1.0.0`.
 
 ## Licence
 
-Apache-2.0 — see [`LICENSE`](LICENSE). Releases up to `v0.11.3` were a
-different program (a TypeScript agent router) under MIT; that code stays in
-the git history and on npm as `@openafw/openafw`.
+Apache-2.0.
