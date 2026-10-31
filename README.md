@@ -33,9 +33,12 @@ Do these steps in order. Ask the user only for what you cannot find yourself.
 `socat` and `ripgrep`.
 
 ```sh
-npm install -g github:openguardrails/rontye
+npm install -g https://github.com/openguardrails/rontye/archive/refs/heads/main.tar.gz
 rontye --help
 ```
+
+Use this URL rather than `github:openguardrails/rontye`: npm can leave a global git install as a
+link to a temporary directory that is then deleted, and the command is simply not found.
 
 **2. Find the model APIs.** Read the agent's own config for each base URL, model name and key.
 See [Agents](#agents) for where each one keeps them. If the user gave a preference for which model
