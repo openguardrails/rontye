@@ -137,6 +137,45 @@ test("a cut mid-stream is not retried: bytes are out, and the next request skips
   assert.equal((await post("auto")).headers.get("x-rontye-upstream"), "a");
 });
 
+test("a client that hangs up mid-stream does not mark the upstream as failed", async () => {
+  primary = (_q, _b, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: [DONE]\n\n");
+    setTimeout(() => res.end(), 200);
+  };
+  const controller = new AbortController();
+  const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "auto", messages: [] }),
+    signal: controller.signal,
+  });
+  const reader = response.body!.getReader();
+  await reader.read();
+  controller.abort();
+  await new Promise((r) => setTimeout(r, 60));
+  primary = ok;
+  assert.equal((await post("auto")).headers.get("x-rontye-upstream"), "a");
+  assert.equal(backupBodies.length, 0);
+});
+
+test("a client that leaves before the first byte does not mark the upstream as failed", async () => {
+  primary = (_q, _b, res) => {
+    setTimeout(() => {
+      if (!res.destroyed) res.end("late");
+    }, 200);
+  };
+  await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "auto", messages: [] }),
+    signal: AbortSignal.timeout(40),
+  }).catch(() => undefined);
+  await new Promise((r) => setTimeout(r, 60));
+  primary = ok;
+  assert.equal((await post("auto")).headers.get("x-rontye-upstream"), "a");
+});
+
 test("every upstream failing answers 502 and names each failure", async () => {
   const fail: Handler = (_q, _b, res) => {
     res.writeHead(500);

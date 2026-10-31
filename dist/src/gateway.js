@@ -162,6 +162,8 @@ export function startGateway(config) {
         if (body)
             headers["content-length"] = String(body.length);
         let settled = false;
+        let replied = false;
+        let clientGone = false;
         const settle = (reason) => {
             if (settled)
                 return;
@@ -198,11 +200,10 @@ export function startGateway(config) {
                 if (size <= MAX_JUDGED_REPLY_BYTES)
                     parts.push(chunk);
             });
-            upstreamRes.on("end", () => {
-                if (!started)
-                    start();
-                res.end();
-                health.ok(name);
+            const finish = () => {
+                if (replied)
+                    return;
+                replied = true;
                 const encoded = Buffer.concat(parts);
                 let reply = null;
                 try {
@@ -213,11 +214,26 @@ export function startGateway(config) {
                     reply = null;
                 }
                 onReply(reply, contentType);
+            };
+            upstreamRes.on("end", () => {
+                if (!started)
+                    start();
+                res.end();
+                health.ok(name);
+                finish();
             });
             upstreamRes.on("error", () => fail(started));
             upstreamRes.on("close", () => {
-                if (!upstreamRes.complete)
-                    fail(started);
+                if (upstreamRes.complete)
+                    return;
+                // Clients often hang up on seeing the end marker. That is not the upstream failing, and
+                // what arrived still gets judged.
+                if (clientGone) {
+                    if (started)
+                        finish();
+                    return settle("the client went away");
+                }
+                fail(started);
             });
         });
         const fail = (started) => {
@@ -245,8 +261,10 @@ export function startGateway(config) {
         });
         client.on("error", (error) => settle(error.message));
         res.on("close", () => {
-            if (!res.writableEnded)
-                client.destroy();
+            if (res.writableEnded)
+                return;
+            clientGone = true;
+            client.destroy();
         });
         client.end(body ?? undefined);
     });
@@ -312,10 +330,10 @@ export function startGateway(config) {
                     }
                     return;
                 }
-                health.fail(name);
-                failures.push(`${name}: ${reason}`);
                 if (res.destroyed)
                     return;
+                health.fail(name);
+                failures.push(`${name}: ${reason}`);
             }
             log("exhausted", { failed: failures });
             return json(res, 502, { error: { message: `rontye gateway: every upstream failed. ${failures.join("; ")}`, type: "rontye_upstreams_failed" } });
