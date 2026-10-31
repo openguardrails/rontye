@@ -132,7 +132,8 @@ export async function run(options: RunOptions): Promise<number> {
     const host = info?.target?.host ?? url.hostname;
     const bytes = Number(request.headers.get("content-length") ?? 0);
     const protocol = classifyModelRequest(request.method, url.pathname);
-    if (!protocol) outbox.push({ t: Date.now(), kind: "network", target: `${host}:${info?.target?.port ?? (url.protocol === "https:" ? 443 : 80)}`, action: request.method, ...(bytes ? { bytes } : {}) });
+    const ownTraffic = ownPort !== null && host === "127.0.0.1" && info?.target?.port === ownPort;
+    if (!protocol && !ownTraffic) outbox.push({ t: Date.now(), kind: "network", target: `${host}:${info?.target?.port ?? (url.protocol === "https:" ? 443 : 80)}`, action: request.method, ...(bytes ? { bytes } : {}) });
     if (protocol) {
       correlator.noteModelHost(host);
       void readModelRequest(request, host, protocol, ownPort !== null && host === "127.0.0.1" && info?.target?.port === ownPort);

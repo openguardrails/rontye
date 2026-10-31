@@ -172,7 +172,7 @@ test("no verdict, fail closed: refused, and it says so rather than looking like 
   assert.equal(upstreamBodies.length, 0);
 });
 
-test("a silent AIRS costs the budget and no more, and the stream is still delivered when open", async () => {
+test("a silent AIRS costs a bounded wait after the reply ends, then fails open", async () => {
   airs = (req, body, res) => {
     if (String(req.headers["content-type"]).includes("event-stream")) return; // never answers
     allowAll(req, body, res);
@@ -182,6 +182,23 @@ test("a silent AIRS costs the budget and no more, and the stream is still delive
     res.end("data: 1\n\n");
   };
   assert.equal(await (await post(port, { stream: true })).text(), "data: 1\n\n");
+});
+
+test("a reply slower than the budget is still judged, because AIRS answers only once it has it all", async () => {
+  upstreamReply = (res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: dangerous-part\n\n");
+    // Several times the 400 ms budget.
+    setTimeout(() => res.end("data: [DONE]\n\n"), 1300);
+  };
+  airs = (req, body, res) => {
+    if (!String(req.headers["content-type"]).includes("event-stream")) return allowAll(req, body, res);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"refused":true}\n\n: ogr {"decision":"block"}\n\n');
+  };
+  const text = await (await post(port, { stream: true })).text();
+  assert.match(text, /refused/);
+  assert.doesNotMatch(text, /dangerous-part/);
 });
 
 test("what the sandbox saw rides the next request, tied to the call", async () => {

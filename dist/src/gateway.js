@@ -290,10 +290,10 @@ export function startGateway(config) {
             });
             airsRes.on("error", () => res.destroy());
         });
-        const headTimer = setTimeout(() => {
-            direct(`no answer from AIRS in ${requestTimeoutMs}ms`);
-            request.destroy();
-        }, requestTimeoutMs);
+        // AIRS may answer nothing until it has judged the whole reply, so its clock starts when it has
+        // the whole reply. Started any earlier, a slow generation would time out into a fail-open, and
+        // every reply slower than the budget would escape judgement.
+        let headTimer;
         request.on("error", (error) => {
             clearTimeout(headTimer);
             if (state === "waiting")
@@ -321,6 +321,12 @@ export function startGateway(config) {
                 }
                 else {
                     request.end();
+                    if (state === "waiting") {
+                        headTimer = setTimeout(() => {
+                            direct(`no answer from AIRS ${requestTimeoutMs * 5}ms after the reply ended`);
+                            request.destroy();
+                        }, requestTimeoutMs * 5);
+                    }
                 }
             },
             abort() {
