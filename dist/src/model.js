@@ -62,6 +62,65 @@ export function toolCallsIn(protocol, body) {
     }
     return calls;
 }
+/** The tool calls in a reply, streamed or whole, so a call is known as it is issued. */
+export function toolCallsInReply(protocol, reply, streamed) {
+    const events = [];
+    if (streamed) {
+        for (const line of reply.split("\n")) {
+            if (!line.startsWith("data:"))
+                continue;
+            try {
+                events.push(JSON.parse(line.slice(5)));
+            }
+            catch {
+                // [DONE], or a frame that is not JSON.
+            }
+        }
+    }
+    else {
+        try {
+            const body = JSON.parse(reply);
+            if (protocol === "anthropic.messages")
+                return toolCallsIn(protocol, { messages: [body] });
+            if (protocol === "openai.chat")
+                return toolCallsIn(protocol, { messages: (body.choices ?? []).map((choice) => choice.message) });
+            return toolCallsIn(protocol, { input: body.output });
+        }
+        catch {
+            return [];
+        }
+    }
+    const calls = new Map();
+    for (const event of events) {
+        if (protocol === "openai.chat") {
+            for (const delta of event?.choices?.[0]?.delta?.tool_calls ?? []) {
+                const call = calls.get(String(delta.index)) ?? { id: "", name: "", args: "" };
+                if (delta.id)
+                    call.id = delta.id;
+                if (delta.function?.name)
+                    call.name = delta.function.name;
+                call.args += delta.function?.arguments ?? "";
+                calls.set(String(delta.index), call);
+            }
+        }
+        else if (protocol === "anthropic.messages") {
+            if (event?.type === "content_block_start" && event.content_block?.type === "tool_use") {
+                calls.set(String(event.index), { id: event.content_block.id, name: event.content_block.name, args: "" });
+            }
+            if (event?.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
+                const call = calls.get(String(event.index));
+                if (call)
+                    call.args += event.delta.partial_json ?? "";
+            }
+        }
+        else if (event?.type === "response.output_item.done") {
+            const [call] = toolCallsIn(protocol, { input: [event.item] });
+            if (call)
+                calls.set(call.id, call);
+        }
+    }
+    return [...calls.values()].filter((call) => call.id);
+}
 /** The call ids that a request's tool results answer. */
 export function toolResultIdsIn(protocol, body) {
     if (!isObject(body))

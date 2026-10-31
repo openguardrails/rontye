@@ -26,7 +26,7 @@ export interface Config {
     /** A shared vLLM can queue a request for minutes before the first byte. */
     firstByteTimeoutMs?: number;
   };
-  airs?: { url: string; apiKeyEnv?: string; apiKey?: string; agentId?: string; agentWorkspace?: string };
+  airs?: { url: string; apiKeyEnv?: string; apiKey?: string; agentId?: string; agentWorkspace?: string; failMode?: "open" | "closed"; requestTimeoutMs?: number };
   sandbox?: { allowHosts?: string[]; denyHosts?: string[]; allowRead?: string[]; allowWrite?: string[]; allowLocalBinding?: boolean };
 }
 
@@ -68,6 +68,10 @@ export function looseConfigWarning(config: Config): string | null {
   if (!inline || process.platform === "win32") return null;
   return (statSync(configPath()).mode & 0o077) === 0 ? null : `${configPath()} holds keys and is readable by others. Run: chmod 600 ${configPath()}`;
 }
+
+/** The environment variables that hold this config's keys, which no sandboxed process may inherit. */
+export const keyEnvNames = (config: Config): string[] =>
+  [config.airs?.apiKeyEnv, ...Object.values(config.gateway?.upstreams ?? {}).map((upstream) => upstream.apiKeyEnv)].filter((name): name is string => Boolean(name));
 
 /** The upstreams to try for a requested model: a route, one upstream by name, or null. */
 export function resolveRoute(gateway: NonNullable<Config["gateway"]>, model: unknown): string[] | null {

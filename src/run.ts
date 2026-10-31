@@ -4,12 +4,13 @@ import { randomBytes } from "node:crypto";
 import zlib from "node:zlib";
 import { SandboxManager, type FilterRequestCallback, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import { airsTarget, guardEvent, report } from "./airs.js";
-import { loadConfig, looseConfigWarning } from "./config.js";
+import { keyEnvNames, loadConfig, looseConfigWarning } from "./config.js";
 import { Correlator } from "./correlate.js";
+import { fileObservation, type Observation } from "./exec.js";
 import { classifyModelRequest, harnessFrom, hostsIn, toolCallsIn, toolResultIdsIn, type LlmProtocol } from "./model.js";
 import { buildPolicy, isLocalTarget, openLoopbackPort, type PolicyOptions } from "./policy.js";
 import { Recorder, safePath } from "./record.js";
-import { ensureGateway, gatewayPort, hydrateEnv } from "./serve.js";
+import { ensureGateway, gatewayPort, gatewayToken, hydrateEnv } from "./serve.js";
 
 export interface RunOptions extends Omit<PolicyOptions, "cwd"> {
   enforce: boolean;
@@ -68,7 +69,7 @@ export async function run(options: RunOptions): Promise<number> {
   const syncGateway = async () => {
     if (ownPort === null) return;
     try {
-      const response = await fetch(`http://127.0.0.1:${ownPort}/__rontye/activity?since=${lastActivity}`, { signal: AbortSignal.timeout(2000) });
+      const response = await fetch(`http://127.0.0.1:${ownPort}/__rontye/activity?since=${lastActivity}`, { headers: { "x-rontye-token": gatewayToken() }, signal: AbortSignal.timeout(2000) });
       const seen = (await response.json()) as { served: number; blind_to: string[]; calls: Array<{ t: number; agent: string; name: string; hosts: string[] }> };
       servedAtStart ??= seen.served;
       if (seen.served > servedAtStart) correlator.noteModelHost("127.0.0.1");
@@ -82,6 +83,21 @@ export async function run(options: RunOptions): Promise<number> {
       // Judged on what is known; the final pass tries again.
     }
   };
+
+  // The sandbox's half of the story, sent to the gateway, which knows which tool call was open.
+  let outbox: Observation[] = [];
+  const sendObservations = async () => {
+    if (ownPort === null || outbox.length === 0) return;
+    const batch = outbox;
+    outbox = [];
+    await fetch(`http://127.0.0.1:${ownPort}/__rontye/observe`, {
+      method: "POST",
+      headers: { "x-rontye-token": gatewayToken() },
+      body: JSON.stringify(batch),
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => undefined);
+  };
+  const observeTimer = setInterval(() => void sendObservations(), 250);
 
   const readModelRequest = async (request: Request, host: string, protocol: LlmProtocol, viaGateway: boolean) => {
     const harness = harnessFrom(request.headers.get("user-agent") ?? "");
@@ -116,6 +132,7 @@ export async function run(options: RunOptions): Promise<number> {
     const host = info?.target?.host ?? url.hostname;
     const bytes = Number(request.headers.get("content-length") ?? 0);
     const protocol = classifyModelRequest(request.method, url.pathname);
+    if (!protocol) outbox.push({ t: Date.now(), kind: "network", target: `${host}:${info?.target?.port ?? (url.protocol === "https:" ? 443 : 80)}`, action: request.method, ...(bytes ? { bytes } : {}) });
     if (protocol) {
       correlator.noteModelHost(host);
       void readModelRequest(request, host, protocol, ownPort !== null && host === "127.0.0.1" && info?.target?.port === ownPort);
@@ -151,6 +168,7 @@ export async function run(options: RunOptions): Promise<number> {
   const ask = async ({ host, port }: { host: string; port?: number | undefined }) => {
     const local = isLocalTarget(host);
     recorder.write("connect", { host, port, allowed: !options.enforce && !local });
+    if (local || options.enforce) outbox.push({ t: Date.now(), kind: "network", target: `${host}:${port}`, denied: true });
     if (local) return { allow: false as const, reason: `rontye: ${host} is this machine or a metadata endpoint. Allow it with --allow-host ${host}:${port}` };
     if (!options.enforce) return true;
     return { allow: false as const, reason: `rontye: ${host} is not allowed. Add it with --allow-host ${host}` };
@@ -167,6 +185,8 @@ export async function run(options: RunOptions): Promise<number> {
       // macOS reports every process's routine system probes; only files and network mean anything here.
       if (/deny\S* (sysctl|system-info|mach-|iokit|ipc-|process-info)/.test(violation.line)) continue;
       recorder.write("violation", { line: violation.line });
+      const file = fileObservation(violation.line, violation.timestamp.getTime());
+      if (file) outbox.push(file);
     }
   });
 
@@ -179,7 +199,9 @@ export async function run(options: RunOptions): Promise<number> {
     commandText: command,
   });
   if (ownPort !== null && process.platform === "darwin") wrapped = openLoopbackPort(wrapped, ownPort);
-  const child = spawn(wrapped, { shell: true, stdio: "inherit" });
+  const childEnv = { ...process.env };
+  for (const name of keyEnvNames(settings)) delete childEnv[name];
+  const child = spawn(wrapped, { shell: true, stdio: "inherit", env: childEnv });
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => child.kill(signal));
   await syncGateway();
   const syncTimer = setInterval(() => void syncGateway().then(() => flush()), 15_000);
@@ -191,6 +213,8 @@ export async function run(options: RunOptions): Promise<number> {
   // The macOS violation monitor reads an asynchronous system log, and body reads may be in flight.
   await new Promise((resolve) => setTimeout(resolve, 1500));
   clearInterval(syncTimer);
+  clearInterval(observeTimer);
+  await sendObservations();
   await syncGateway();
   flush(true);
   recorder.write("exit", { code });

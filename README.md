@@ -134,13 +134,26 @@ approval prompts, and applies to that launch only.
 - **Said vs did.** Compares the destinations named in tool calls with the connections made, and
   reports the rest as `FINDING`. A model that fetches a script from a trusted host and uploads your
   keys somewhere else passes any allowlist, but not this.
-- **AIRS.** Sends both halves of every model call through the gateway for judging, without delaying it.
+- **AIRS, enforced.** With `airs` configured, every model call is judged inline and the verdict is
+  carried out. A refused request never reaches the model. Secrets are replaced before the model sees
+  them and restored on the way back. A streamed reply goes through AIRS: tool calls wait for the
+  verdict, and a refused one never reaches the agent, which gets an explanation it can act on. The
+  workspace's mode decides whether AIRS refuses (`enforce`) or only records (`observe`).
+- **Tool calls tied to what they did.** Each connection and refused file is tied to the tool call
+  open at that moment, and sent to AIRS with the next step: `call_1` named `github.com`, and also
+  POSTed 40 KB to a host it never mentioned.
 
 ## What it does not do yet
 
-- **A verdict stops nothing.** AIRS judges each call after it has been forwarded, and `block` is only
-  recorded. A tool call still runs. So today Ron contains what an agent can reach, and AIRS tells you
-  what it tried. Secrets are not masked, and the request and reply go to AIRS as they are.
+- **Judging costs time.** Every model call waits for AIRS first, and if the workspace masks PII in
+  output, AIRS holds the whole reply until it is judged, so nothing streams live.
+- **With no verdict, traffic passes by default.** Set `"failMode": "closed"` under `airs` to refuse
+  instead. A refusal for that reason answers 503 with `x-rontye-verdict: fail-closed`, so it does not
+  look like policy.
+- **Exec evidence informs and does not decide.** It reaches the console as the sensor's word. No
+  guardrail reads it yet. An AIRS older than 1.11 refuses the field, so Ron drops it, and the evidence
+  stays in `gateway.ndjson`. Activity after the last model call has no event to ride on.
+- **Parallel tool calls share what happened.** Ron does not guess which one did it.
 - **A cut stream cannot be switched.** Once bytes have reached the client, a failure ends that
   response. The client's retry goes to the next upstream.
 - **`--allow-local-bind` opens every local port on macOS,** not just the agent's own, including a
@@ -154,8 +167,9 @@ approval prompts, and applies to that launch only.
 - **The credential list is a starting point.** A key at an unlisted path stays readable.
 
 Records are in `~/.rontye/`: `runs/` for each sandboxed run and `gateway.ndjson` for the gateway, both
-mode 0600. They hold destinations, tool names and verdicts, and never a body, a query string, a tool
-argument or a key.
+mode 0600. They hold destinations, tool names, refused paths and verdicts, and never a body, a query string, a
+tool argument or a key. Agents cannot read this directory, your shell startup files or the key
+variables named in the config.
 
 ## What it is built on
 

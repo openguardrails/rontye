@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { userInfo } from "node:os";
 import { secretOf } from "./config.js";
-export const INTEGRATION = "rontye/0.2.0";
+export const INTEGRATION = "rontye/0.3.0";
 export function airsTarget(config) {
     const apiKey = config.airs ? secretOf(config.airs) : undefined;
     if (!config.airs || !apiKey)

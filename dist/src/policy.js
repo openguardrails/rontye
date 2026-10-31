@@ -4,6 +4,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 /** Where credentials live. A starting point rather than a boundary: an unlisted path stays readable. */
 const CREDENTIAL_PATHS = [
+    // Ron's own keys, and shell startup files, where people export theirs.
+    ".rontye", ".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile",
     ".ssh", ".aws", ".azure", ".oci", ".kube", ".gnupg", ".config/gcloud", ".config/gh",
     ".docker/config.json", ".netrc", ".npmrc", ".pypirc", ".pgpass", ".git-credentials", ".boto", ".my.cnf",
 ];

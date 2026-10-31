@@ -4,7 +4,7 @@ import { userInfo } from "node:os";
 import { secretOf, type Config } from "./config.js";
 import type { LlmProtocol } from "./model.js";
 
-export const INTEGRATION = "rontye/0.2.0";
+export const INTEGRATION = "rontye/0.3.0";
 
 export interface AirsTarget {
   url: string;

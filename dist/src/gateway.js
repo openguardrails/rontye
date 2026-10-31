@@ -4,7 +4,7 @@
  * the members of a route must speak the protocol their client speaks.
  */
 import { randomBytes } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import { hostname, userInfo } from "node:os";
@@ -12,7 +12,8 @@ import { join } from "node:path";
 import zlib from "node:zlib";
 import { INTEGRATION } from "./airs.js";
 import { rontyeHome, resolveRoute, secretOf } from "./config.js";
-import { classifyModelRequest, harnessFrom, hostsIn, toolCallsIn, toolResultIdsIn } from "./model.js";
+import { ExecTracker } from "./exec.js";
+import { classifyModelRequest, harnessFrom, hostsIn, toolCallsIn, toolCallsInReply, toolResultIdsIn } from "./model.js";
 /** The request's fault: another upstream would refuse it too, so it goes back to the client. */
 export const isFailoverStatus = (status) => status >= 500 || [401, 403, 404, 408, 429].includes(status);
 export function rewriteBody(body, upstream) {
@@ -84,6 +85,28 @@ const readAll = (stream) => new Promise((resolve, reject) => {
 });
 /** Beyond this a reply is forwarded but not sent for judging; a process must not grow without bound. */
 const MAX_JUDGED_REPLY_BYTES = 64 * 1024 * 1024;
+/** The cases of the verdict's `payload`. A `block` with a continuation is a body to carry on with. */
+export function readVerdict(verdict) {
+    const { decision, payload, continuation, payload_stream: stream } = verdict;
+    if (decision === "block" && !(continuation && typeof payload === "object" && payload && continuation.style !== "answer")) {
+        if (typeof payload === "string" && stream)
+            return { kind: "answer", status: 200, contentType: "text/event-stream", body: payload, reason: "blocked" };
+        if (payload && typeof payload === "object")
+            return { kind: "answer", status: 200, contentType: "application/json", body: JSON.stringify(payload), reason: "blocked" };
+        // Nothing rendered, as for a canonical event: refusing is the only reading of a block.
+        return { kind: "answer", status: 403, contentType: "application/json", body: JSON.stringify({ error: { message: "Refused by OpenGuardrails AIRS.", type: "rontye_blocked" } }), reason: "blocked" };
+    }
+    if (payload && typeof payload === "object")
+        return { kind: "forward", body: payload };
+    return { kind: "forward" };
+}
+const refusal = (message) => ({
+    kind: "answer",
+    status: 503,
+    contentType: "application/json",
+    body: JSON.stringify({ error: { message, type: "rontye_fail_closed" } }),
+    reason: "fail-closed",
+});
 export function startGateway(config) {
     const gateway = config.gateway;
     const health = new Health(gateway.cooldownMs ?? 30_000);
@@ -91,13 +114,21 @@ export function startGateway(config) {
     const firstByteTimeoutMs = gateway.firstByteTimeoutMs ?? 600_000;
     const airs = config.airs;
     const airsKey = airs ? secretOf(airs) : undefined;
+    const failClosed = airs?.failMode === "closed";
+    const requestTimeoutMs = airs?.requestTimeoutMs ?? 6_000;
     let lastFailover = null;
     let served = 0;
     // What runs ask for, since agents reach the gateway directly and their calls never pass the proxy.
     const seenCalls = new Set();
     const activity = [];
     const blindTo = new Set();
+    const exec = new ExecTracker();
+    // An older AIRS refuses the field. The judgement matters more than the evidence, so it is dropped.
+    let execRefused = false;
     mkdirSync(rontyeHome(), { recursive: true, mode: 0o700 });
+    // Sandboxed agents can reach this port, so what only `rontye run` may do takes a token they cannot read.
+    const internalToken = randomBytes(24).toString("hex");
+    writeFileSync(join(rontyeHome(), "gateway.token"), internalToken, { mode: 0o600 });
     const log = (type, fields) => appendFileSync(join(rontyeHome(), "gateway.ndjson"), `${JSON.stringify({ t: new Date().toISOString(), type, ...fields })}\n`, { mode: 0o600 });
     const identity = (agentType) => ({
         id: airs?.agentId ?? `${agentType}-${hostname()}`,
@@ -105,65 +136,212 @@ export function startGateway(config) {
         workspace: airs?.agentWorkspace ?? "",
         user: userInfo().username,
     });
-    const postVerdict = async (kind, stepId, init) => {
+    const airsUrl = () => new URL(`${airs.url.replace(/\/$/, "")}/v1/evaluate?payload=true`);
+    const noteCalls = (agentType, calls, t) => {
+        const opened = [];
+        for (const call of calls) {
+            const hosts = hostsIn(call.args);
+            opened.push({ id: call.id, hosts });
+            if (seenCalls.has(call.id))
+                continue;
+            seenCalls.add(call.id);
+            activity.push({ t, agent: agentType, name: call.name, hosts });
+            if (activity.length > 5000)
+                activity.shift();
+        }
+        exec.open(opened, t);
+    };
+    /** Judges a request before the model sees it. An absent verdict follows the fail mode. */
+    const judgeRequest = async (stepId, protocol, payload, agentType, endpoint, report) => {
+        if (!airsKey)
+            return { kind: "forward" };
+        const who = identity(agentType);
+        const event = {
+            kind: "step/request", step_id: stepId, agent_id: who.id, agent_type: who.type, agent_workspace: who.workspace,
+            agent_user: who.user, llm_protocol: protocol, payload, integration: INTEGRATION, llm_endpoint: endpoint,
+        };
+        const post = (body) => fetch(airsUrl(), {
+            method: "POST",
+            headers: { authorization: `Bearer ${airsKey}`, "content-type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(requestTimeoutMs),
+        });
         try {
-            const response = await fetch(`${airs.url.replace(/\/$/, "")}/v1/evaluate`, {
-                method: "POST",
-                headers: { authorization: `Bearer ${airsKey}`, ...init.headers },
-                body: init.body,
-                signal: AbortSignal.timeout(30_000),
-            });
+            let response = await post(report && !execRefused ? { ...event, exec: report } : event);
+            if (response.status === 400 && report && !execRefused) {
+                const text = await response.text();
+                if (/\bexec\b/.test(text)) {
+                    execRefused = true;
+                    log("exec_refused", { detail: "this AIRS does not accept the exec field; evidence stays in this log" });
+                    response = await post(event);
+                }
+                else {
+                    throw new Error(`HTTP 400 ${text.slice(0, 200)}`);
+                }
+            }
             const verdict = (await response.json().catch(() => ({})));
             // A 200 without a decision is not a verdict.
             if (!response.ok || !verdict.decision)
                 throw new Error(`HTTP ${response.status}`);
-            log("verdict", { kind, step: stepId, decision: verdict.decision, findings: verdict.findings?.length ?? 0 });
+            log("verdict", { kind: "step/request", step: stepId, decision: verdict.decision, findings: verdict.findings?.length ?? 0 });
+            if (failClosed && verdict.unjudged?.length)
+                return refusal("OpenGuardrails AIRS could not judge all of this request.");
+            return readVerdict(verdict);
         }
         catch (error) {
-            log("verdict", { kind, step: stepId, decision: "unjudged", error: String(error) });
+            log("verdict", { kind: "step/request", step: stepId, decision: "unjudged", error: String(error) });
+            return failClosed ? refusal("OpenGuardrails AIRS gave no verdict, and this gateway fails closed.") : { kind: "forward" };
         }
     };
-    const reportRequest = (stepId, protocol, payload, agentType, endpoint) => {
+    /** Judges a whole, unstreamed reply. Answers what the client should receive. */
+    const judgeWholeReply = async (stepId, protocol, reply, agentType, endpoint) => {
         if (!airsKey)
-            return Promise.resolve();
+            return { body: reply };
         const who = identity(agentType);
-        return postVerdict("step/request", stepId, {
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-                kind: "step/request", step_id: stepId, agent_id: who.id, agent_type: who.type, agent_workspace: who.workspace,
-                agent_user: who.user, llm_protocol: protocol, payload, integration: INTEGRATION, llm_endpoint: endpoint,
-            }),
-        });
-    };
-    const reportResponse = (stepId, protocol, reply, contentType, agentType, endpoint) => {
-        const who = identity(agentType);
-        if (contentType.includes("text/event-stream")) {
-            return postVerdict("step/response", stepId, {
-                headers: {
-                    "content-type": "text/event-stream", "ogr-kind": "step/response", "ogr-step-id": stepId, "ogr-llm-protocol": protocol,
-                    "ogr-agent-id": who.id, "ogr-agent-type": who.type, "ogr-agent-workspace": who.workspace, "ogr-agent-user": who.user,
-                    "ogr-integration": INTEGRATION, "ogr-llm-endpoint": endpoint,
-                },
-                body: reply,
+        try {
+            const response = await fetch(airsUrl(), {
+                method: "POST",
+                headers: { authorization: `Bearer ${airsKey}`, "content-type": "application/json" },
+                body: JSON.stringify({
+                    kind: "step/response", step_id: stepId, agent_id: who.id, agent_type: who.type, agent_workspace: who.workspace,
+                    agent_user: who.user, llm_protocol: protocol, payload: JSON.parse(reply.toString("utf8")), integration: INTEGRATION, llm_endpoint: endpoint,
+                }),
+                signal: AbortSignal.timeout(requestTimeoutMs * 3),
             });
+            const verdict = (await response.json().catch(() => ({})));
+            if (!response.ok || !verdict.decision)
+                throw new Error(`HTTP ${response.status}`);
+            log("verdict", { kind: "step/response", step: stepId, decision: verdict.decision, findings: verdict.findings?.length ?? 0 });
+            const judged = readVerdict(verdict);
+            if (judged.kind === "answer")
+                return { status: judged.status, body: judged.body, contentType: judged.contentType, refused: true };
+            return { body: judged.body ? JSON.stringify(judged.body) : reply };
         }
-        return postVerdict("step/response", stepId, {
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-                kind: "step/response", step_id: stepId, agent_id: who.id, agent_type: who.type, agent_workspace: who.workspace,
-                agent_user: who.user, llm_protocol: protocol, payload: JSON.parse(reply.toString("utf8")), integration: INTEGRATION, llm_endpoint: endpoint,
-            }),
+        catch (error) {
+            log("verdict", { kind: "step/response", step: stepId, decision: "unjudged", error: String(error) });
+            if (!failClosed)
+                return { body: reply };
+            const refused = refusal("OpenGuardrails AIRS gave no verdict, and this gateway fails closed.");
+            return { status: refused.status, body: refused.body, contentType: refused.contentType, refused: true };
+        }
+    };
+    /**
+     * Carries a streamed reply through AIRS: the frames go up as they arrive, and what comes back is
+     * what the client gets. Prose flows live; tool calls and the end wait for the verdict.
+     */
+    const judgedStream = (stepId, protocol, agentType, endpoint, res, outHeaders, status) => {
+        const who = identity(agentType);
+        const url = airsUrl();
+        const held = [];
+        let state = "waiting";
+        let upstreamEnded = false;
+        let tail = "";
+        const direct = (why) => {
+            if (state !== "waiting")
+                return;
+            log("verdict", { kind: "step/response", step: stepId, decision: "unjudged", error: why });
+            if (failClosed) {
+                state = "direct";
+                const refused = refusal("OpenGuardrails AIRS gave no verdict, and this gateway fails closed.");
+                res.writeHead(refused.status, { "content-type": refused.contentType });
+                res.end(refused.body);
+                return;
+            }
+            state = "direct";
+            res.writeHead(status, outHeaders);
+            for (const chunk of held)
+                res.write(chunk);
+            held.length = 0;
+            if (upstreamEnded)
+                res.end();
+        };
+        const request = (url.protocol === "https:" ? https : http).request(url, {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${airsKey}`, "content-type": "text/event-stream", "ogr-kind": "step/response", "ogr-step-id": stepId, "ogr-llm-protocol": protocol,
+                "ogr-agent-id": who.id, "ogr-agent-type": who.type, "ogr-agent-workspace": who.workspace, "ogr-agent-user": who.user,
+                "ogr-integration": INTEGRATION, "ogr-llm-endpoint": endpoint, "ogr-fail-mode": failClosed ? "closed" : "open",
+            },
+        }, (airsRes) => {
+            clearTimeout(headTimer);
+            if (airsRes.statusCode !== 200 || !String(airsRes.headers["content-type"]).includes("text/event-stream")) {
+                airsRes.resume();
+                return direct(`AIRS answered HTTP ${airsRes.statusCode}`);
+            }
+            state = "judged";
+            held.length = 0;
+            const { "content-length": _length, "content-encoding": _encoding, ...headers } = outHeaders;
+            res.writeHead(200, { ...headers, "content-type": "text/event-stream" });
+            airsRes.on("data", (chunk) => {
+                res.write(chunk);
+                tail = (tail + chunk.toString("utf8")).slice(-8192);
+            });
+            airsRes.on("end", () => {
+                res.end();
+                const verdict = /: ogr (\{.*\})/.exec(tail)?.[1];
+                let decision = "unknown";
+                try {
+                    decision = JSON.parse(verdict ?? "{}").decision ?? "unknown";
+                }
+                catch {
+                    // Reported as unknown.
+                }
+                log("verdict", { kind: "step/response", step: stepId, decision });
+            });
+            airsRes.on("error", () => res.destroy());
         });
+        const headTimer = setTimeout(() => {
+            direct(`no answer from AIRS in ${requestTimeoutMs}ms`);
+            request.destroy();
+        }, requestTimeoutMs);
+        request.on("error", (error) => {
+            clearTimeout(headTimer);
+            if (state === "waiting")
+                direct(String(error));
+            else if (state === "judged")
+                res.destroy();
+        });
+        return {
+            write(chunk) {
+                if (state === "direct") {
+                    if (!res.writableEnded)
+                        res.write(chunk);
+                }
+                else {
+                    if (state === "waiting")
+                        held.push(chunk);
+                    request.write(chunk);
+                }
+            },
+            end() {
+                upstreamEnded = true;
+                if (state === "direct") {
+                    if (!res.writableEnded)
+                        res.end();
+                }
+                else {
+                    request.end();
+                }
+            },
+            abort() {
+                clearTimeout(headTimer);
+                request.destroy();
+            },
+        };
     };
     /** One attempt. Resolves with why it failed, or null once the reply is the client's. */
-    const attempt = (name, upstream, path, protocol, method, clientHeaders, body, res, onReply) => new Promise((resolve) => {
+    const attempt = (name, upstream, path, protocol, stepId, agentType, method, clientHeaders, body, res) => new Promise((resolve) => {
         const url = upstreamUrl(upstream.baseURL, path);
         const headers = upstreamHeaders(clientHeaders, protocol, secretOf(upstream));
-        if (body)
-            headers["content-length"] = String(body.length);
+        headers["content-length"] = String(body.length);
+        // The reply is read here and sent on to AIRS, so it has to arrive readable.
+        if (airsKey)
+            delete headers["accept-encoding"];
+        const endpoint = new URL(upstream.baseURL).host;
         let settled = false;
         let replied = false;
         let clientGone = false;
+        let sink = null;
         const settle = (reason) => {
             if (settled)
                 return;
@@ -178,52 +356,77 @@ export function startGateway(config) {
                 return settle(`HTTP ${status}`);
             }
             const contentType = String(upstreamRes.headers["content-type"] ?? "");
+            const streamed = contentType.includes("text/event-stream");
+            const encoding = upstreamRes.headers["content-encoding"];
             const parts = [];
             let size = 0;
             let started = false;
+            const out = { ...upstreamRes.headers, "x-rontye-upstream": name };
+            delete out.connection;
+            delete out["keep-alive"];
+            delete out["transfer-encoding"];
             // The head waits for the first byte: until a byte has gone out, a failure can still fail over.
             const start = () => {
                 started = true;
                 clearTimeout(firstByteTimer);
                 settle(null);
-                const out = { ...upstreamRes.headers, "x-rontye-upstream": name };
-                delete out.connection;
-                delete out["keep-alive"];
-                delete out["transfer-encoding"];
-                res.writeHead(status, out);
+                if (airsKey && streamed && status < 400 && !encoding)
+                    sink = judgedStream(stepId, protocol, agentType, endpoint, res, out, status);
+                else if (!airsKey || status >= 400)
+                    res.writeHead(status, out);
             };
-            upstreamRes.on("data", (chunk) => {
-                if (!started)
-                    start();
-                res.write(chunk);
-                size += chunk.length;
-                if (size <= MAX_JUDGED_REPLY_BYTES)
-                    parts.push(chunk);
-            });
+            const decoded = () => {
+                if (size > MAX_JUDGED_REPLY_BYTES)
+                    return null;
+                try {
+                    return decode(Buffer.concat(parts), encoding);
+                }
+                catch {
+                    return null;
+                }
+            };
             const finish = () => {
                 if (replied)
                     return;
                 replied = true;
-                const encoded = Buffer.concat(parts);
-                let reply = null;
-                try {
-                    if (status < 400 && size <= MAX_JUDGED_REPLY_BYTES)
-                        reply = decode(encoded, upstreamRes.headers["content-encoding"]);
-                }
-                catch {
-                    reply = null;
-                }
-                onReply(reply, contentType);
+                const reply = status < 400 ? decoded() : null;
+                log("step", { step: stepId, upstream: name, model: upstream.model, protocol, agent_type: agentType, reply_bytes: reply?.length ?? null });
+                if (reply)
+                    noteCalls(agentType, toolCallsInReply(protocol, reply.toString("utf8"), streamed), Date.now());
             };
-            upstreamRes.on("end", () => {
+            upstreamRes.on("data", (chunk) => {
                 if (!started)
                     start();
-                res.end();
+                size += chunk.length;
+                if (size <= MAX_JUDGED_REPLY_BYTES)
+                    parts.push(chunk);
+                if (sink)
+                    sink.write(chunk);
+                else if (res.headersSent)
+                    res.write(chunk);
+            });
+            upstreamRes.on("end", async () => {
+                if (!started)
+                    start();
                 health.ok(name);
                 finish();
+                if (sink)
+                    return sink.end();
+                if (res.headersSent)
+                    return void res.end();
+                // A whole reply, held for its verdict.
+                const reply = decoded();
+                if (!reply) {
+                    res.writeHead(status, out);
+                    return void res.end(Buffer.concat(parts));
+                }
+                const judged = await judgeWholeReply(stepId, protocol, reply, agentType, endpoint);
+                const { "content-encoding": _encoding, "content-length": _length, ...headers } = out;
+                res.writeHead(judged.status ?? status, { ...headers, ...(judged.contentType ? { "content-type": judged.contentType } : {}) });
+                res.end(judged.body);
             });
             // Clients often hang up on seeing the end marker. That is not the upstream failing, and what
-            // arrived still gets judged. Either event can come first, so both ask the same question.
+            // arrived is still recorded. Either event can come first, so both ask the same question.
             const broken = () => {
                 if (upstreamRes.complete)
                     return;
@@ -243,6 +446,7 @@ export function startGateway(config) {
             // Too late to switch: bytes are out. The client sees a cut stream, and its retry skips this upstream.
             health.fail(name);
             log("cut", { upstream: name });
+            sink?.abort();
             res.destroy();
         };
         const firstByteTimer = setTimeout(() => {
@@ -265,9 +469,10 @@ export function startGateway(config) {
             if (res.writableEnded)
                 return;
             clientGone = true;
+            sink?.abort();
             client.destroy();
         });
-        client.end(body ?? undefined);
+        client.end(body);
     });
     const json = (res, status, value) => {
         res.writeHead(status, { "content-type": "application/json" });
@@ -277,11 +482,22 @@ export function startGateway(config) {
         try {
             const url = new URL(req.url ?? "/", "http://gateway");
             if (url.pathname === "/__rontye/health") {
-                return json(res, 200, { ok: true, pid: process.pid, served, cooling: health.cooling(), last_failover: lastFailover, airs: Boolean(airsKey) });
+                return json(res, 200, { ok: true, pid: process.pid, served, cooling: health.cooling(), last_failover: lastFailover, airs: Boolean(airsKey), exec_refused: execRefused });
+            }
+            if (url.pathname.startsWith("/__rontye/") && req.headers["x-rontye-token"] !== internalToken) {
+                return json(res, 403, { error: { message: "rontye: this path is for rontye run" } });
             }
             if (url.pathname === "/__rontye/activity") {
                 const since = Number(url.searchParams.get("since") ?? 0);
                 return json(res, 200, { served, blind_to: [...blindTo], calls: activity.filter((call) => call.t > since) });
+            }
+            if (url.pathname === "/__rontye/observe" && req.method === "POST") {
+                const observations = JSON.parse((await readAll(req)).toString("utf8"));
+                for (const observation of observations.slice(0, 1000)) {
+                    const item = exec.observe(observation);
+                    log("exec", { ...observation, call_ids: item.call_ids, undeclared: item.undeclared ?? false });
+                }
+                return json(res, 200, { ok: true });
             }
             if (req.method === "GET" && /\/models$/.test(url.pathname)) {
                 const names = [...Object.keys(gateway.routes ?? {}), ...Object.keys(gateway.upstreams)];
@@ -299,30 +515,27 @@ export function startGateway(config) {
             served += 1;
             const stepId = randomBytes(16).toString("hex");
             const agentType = harnessFrom(req.headers["user-agent"] ?? "");
-            for (const call of toolCallsIn(protocol, parsed)) {
-                if (seenCalls.has(call.id))
-                    continue;
-                seenCalls.add(call.id);
-                activity.push({ t: Date.now(), agent: agentType, name: call.name, hosts: hostsIn(call.args) });
-                if (activity.length > 5000)
-                    activity.shift();
-            }
-            if (toolResultIdsIn(protocol, parsed).some((id) => !seenCalls.has(id)))
+            const now = Date.now();
+            // History names calls too, for a client whose reply never passed through this gateway.
+            noteCalls(agentType, toolCallsIn(protocol, parsed), now);
+            const resultIds = toolResultIdsIn(protocol, parsed);
+            if (resultIds.some((id) => !seenCalls.has(id)))
                 blindTo.add(agentType);
+            exec.close(resultIds, now);
+            const order = health.order(members);
+            const first = gateway.upstreams[order[0]];
+            const judged = await judgeRequest(stepId, protocol, { ...parsed, model: first.model }, agentType, new URL(first.baseURL).host, exec.drain());
+            if (judged.kind === "answer") {
+                log("refused", { step: stepId, reason: judged.reason, agent_type: agentType });
+                res.writeHead(judged.status, { "content-type": judged.contentType, "x-rontye-verdict": judged.reason });
+                return void res.end(judged.body);
+            }
+            const payload = judged.body ?? parsed;
             const failures = [];
-            for (const name of health.order(members)) {
+            for (const name of order) {
                 const upstream = gateway.upstreams[name];
-                const body = Buffer.from(JSON.stringify(rewriteBody(parsed, upstream)));
-                const endpoint = new URL(upstream.baseURL).host;
-                let requestReported = Promise.resolve();
-                const reason = await attempt(name, upstream, url.pathname, protocol, req.method, req.headers, body, res, (reply, contentType) => {
-                    log("step", { step: stepId, upstream: name, model: upstream.model, protocol, agent_type: agentType, reply_bytes: reply?.length ?? null });
-                    if (!airsKey || !reply)
-                        return;
-                    // Reported after the fact and never awaited by the client: the two halves stay in order.
-                    requestReported = reportRequest(stepId, protocol, rewriteBody(parsed, upstream), agentType, endpoint);
-                    void requestReported.then(() => reportResponse(stepId, protocol, reply, contentType, agentType, endpoint)).catch((error) => log("verdict", { step: stepId, decision: "unjudged", error: String(error) }));
-                });
+                const body = Buffer.from(JSON.stringify(rewriteBody(payload, upstream)));
+                const reason = await attempt(name, upstream, url.pathname, protocol, stepId, agentType, req.method, req.headers, body, res);
                 if (reason === null) {
                     if (failures.length > 0) {
                         lastFailover = { to: name, failed: failures, t: new Date().toISOString() };

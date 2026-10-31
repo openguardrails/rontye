@@ -1,11 +1,20 @@
 /** Starting, stopping and checking the gateway, a background process every `rontye run` shares. */
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { configPath, DEFAULT_PORT, loadConfig, looseConfigWarning, rontyeHome, secretOf, type Config } from "./config.js";
 import { startGateway } from "./gateway.js";
 
 export const gatewayPort = (config: Config) => config.gateway?.port ?? DEFAULT_PORT;
+
+/** Proves a caller is `rontye run`. The file sits where the sandbox cannot read. */
+export const gatewayToken = (): string => {
+  try {
+    return readFileSync(join(rontyeHome(), "gateway.token"), "utf8").trim();
+  } catch {
+    return "";
+  }
+};
 
 export async function gatewayHealth(port: number): Promise<Record<string, any> | null> {
   try {

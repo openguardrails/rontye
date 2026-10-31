@@ -42,6 +42,8 @@ export function looseConfigWarning(config) {
         return null;
     return (statSync(configPath()).mode & 0o077) === 0 ? null : `${configPath()} holds keys and is readable by others. Run: chmod 600 ${configPath()}`;
 }
+/** The environment variables that hold this config's keys, which no sandboxed process may inherit. */
+export const keyEnvNames = (config) => [config.airs?.apiKeyEnv, ...Object.values(config.gateway?.upstreams ?? {}).map((upstream) => upstream.apiKeyEnv)].filter((name) => Boolean(name));
 /** The upstreams to try for a requested model: a route, one upstream by name, or null. */
 export function resolveRoute(gateway, model) {
     if (typeof model !== "string")

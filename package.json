@@ -1,6 +1,6 @@
 {
   "name": "rontye",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A local AI gateway, firewall and sandbox for your agents.",
   "license": "Apache-2.0",
   "type": "module",
