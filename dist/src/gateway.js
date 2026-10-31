@@ -222,19 +222,20 @@ export function startGateway(config) {
                 health.ok(name);
                 finish();
             });
-            upstreamRes.on("error", () => fail(started));
-            upstreamRes.on("close", () => {
+            // Clients often hang up on seeing the end marker. That is not the upstream failing, and what
+            // arrived still gets judged. Either event can come first, so both ask the same question.
+            const broken = () => {
                 if (upstreamRes.complete)
                     return;
-                // Clients often hang up on seeing the end marker. That is not the upstream failing, and
-                // what arrived still gets judged.
                 if (clientGone) {
                     if (started)
                         finish();
                     return settle("the client went away");
                 }
                 fail(started);
-            });
+            };
+            upstreamRes.on("error", broken);
+            upstreamRes.on("close", broken);
         });
         const fail = (started) => {
             if (!started)
