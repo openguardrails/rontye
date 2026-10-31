@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+Adds the gateway: one local base URL in front of many model APIs, with ordered failover, keys held
+outside the agents, and both halves of each call sent to AIRS. Adds `rontye status`, `serve` and
+`stop`, and `~/.rontye/config.json`. This machine and metadata endpoints are now refused in every
+mode. The README is written for agents to follow.
+
 ## 0.1.0
 
 A new program, replacing OpenAFW in this repository. `rontye run` starts a command in an OS sandbox,

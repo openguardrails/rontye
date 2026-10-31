@@ -10,6 +10,7 @@ export interface PolicyOptions {
   denyHosts: string[];
   allowRead: string[];
   allowWrite: string[];
+  allowLocalBinding?: boolean;
 }
 
 /** Where credentials live. A starting point rather than a boundary: an unlisted path stays readable. */
@@ -20,7 +21,7 @@ const CREDENTIAL_PATHS = [
 
 /** Where the agents this is built for keep their own state; without these they fail to start. */
 const AGENT_STATE_PATHS = [
-  ".claude", ".claude.json", ".codex", ".gemini", ".pi", ".hermes", ".openclaw", ".aider",
+  ".claude", ".claude.json", ".codex", ".gemini", ".pi", ".dsh", ".hermes", ".openclaw", ".aider",
   ".config/opencode", ".local/share/opencode", ".local/state", ".cache", ".npm", ".bun", "Library/Caches",
 ];
 
@@ -33,6 +34,30 @@ const real = (path: string) => {
   }
 };
 
+/**
+ * This machine and the cloud metadata endpoints: what a poisoned model probes first, and never a
+ * destination an agent found by itself. Allow one by name with --allow-host. Private LAN ranges
+ * are not on this list, because intranet services are ordinary work.
+ */
+export function isLocalTarget(host: string): boolean {
+  const name = host.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  if (name === "localhost" || name.endsWith(".localhost")) return true;
+  if (name === "::1" || name === "::" || name.startsWith("fe80:") || name.startsWith("fd00:ec2:")) return true;
+  if (name.startsWith("::ffff:")) return isLocalTarget(name.slice(7));
+  return /^(127|0|169\.254)\.[\d.]+$/.test(name) || ["100.100.100.200", "168.63.129.16", "192.0.0.192", "metadata.google.internal"].includes(name);
+}
+
+/**
+ * Opens one loopback port on macOS. Agents commonly refuse to proxy loopback addresses (dsh does,
+ * by design), so the gateway must be reachable directly, and sandbox-runtime's only switch for
+ * that opens every local port, browser debugging ports included.
+ */
+export function openLoopbackPort(wrapped: string, port: number): string {
+  const rule = /\(allow network-outbound \(remote ip "localhost:\d+"\)\)/;
+  if (!rule.test(wrapped)) throw new Error("this sandbox-runtime version has an unexpected profile; rontye cannot open the gateway port");
+  return wrapped.replace(rule, (match) => `${match}\n(allow network-outbound (remote ip "localhost:${port}"))`);
+}
+
 export function buildPolicy(options: PolicyOptions): SandboxRuntimeConfig {
   const home = homedir();
   const inHome = (path: string) => join(home, path);
@@ -42,6 +67,7 @@ export function buildPolicy(options: PolicyOptions): SandboxRuntimeConfig {
       // observe mode lets it through and writes it down.
       allowedDomains: options.allowHosts,
       deniedDomains: options.denyHosts,
+      ...(options.allowLocalBinding ? { allowLocalBinding: true } : {}),
     },
     filesystem: {
       denyRead: [

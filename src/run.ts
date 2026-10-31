@@ -3,14 +3,17 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import zlib from "node:zlib";
 import { SandboxManager, type FilterRequestCallback, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
-import { airsFromEnv, guardEvent, report } from "./airs.js";
+import { airsTarget, guardEvent, report } from "./airs.js";
+import { loadConfig, looseConfigWarning } from "./config.js";
 import { Correlator } from "./correlate.js";
 import { classifyModelRequest, harnessFrom, hostsIn, toolCallsIn, toolResultIdsIn, type LlmProtocol } from "./model.js";
-import { buildPolicy, type PolicyOptions } from "./policy.js";
+import { buildPolicy, isLocalTarget, openLoopbackPort, type PolicyOptions } from "./policy.js";
 import { Recorder, safePath } from "./record.js";
+import { ensureGateway, gatewayPort, hydrateEnv } from "./serve.js";
 
 export interface RunOptions extends Omit<PolicyOptions, "cwd"> {
   enforce: boolean;
+  allowLocalBinding?: boolean;
   command: string[];
 }
 
@@ -33,7 +36,14 @@ export async function run(options: RunOptions): Promise<number> {
   const runId = `${new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15)}-${randomBytes(3).toString("hex")}`;
   const recorder = new Recorder(runId);
   const correlator = new Correlator();
-  const airs = airsFromEnv(process.env);
+  const settings = loadConfig();
+  hydrateEnv(settings);
+  const warning = looseConfigWarning(settings);
+  if (warning) process.stderr.write(`[rontye] ${warning}\n`);
+  const airs = airsTarget(settings);
+  // The gateway reports what passes through it; reporting it here too would judge each call twice.
+  const ownPort = settings.gateway ? gatewayPort(settings) : null;
+  if (settings.gateway) await ensureGateway(settings);
   const seenCalls = new Set<string>();
   const command = options.command.map(quote).join(" ");
 
@@ -51,7 +61,29 @@ export async function run(options: RunOptions): Promise<number> {
     }
   };
 
-  const readModelRequest = async (request: Request, host: string, protocol: LlmProtocol) => {
+  // Calls that went straight to the gateway never pass this process's proxy, so they are asked for.
+  const startedAt = Date.now();
+  let lastActivity = startedAt;
+  let servedAtStart: number | null = null;
+  const syncGateway = async () => {
+    if (ownPort === null) return;
+    try {
+      const response = await fetch(`http://127.0.0.1:${ownPort}/__rontye/activity?since=${lastActivity}`, { signal: AbortSignal.timeout(2000) });
+      const seen = (await response.json()) as { served: number; blind_to: string[]; calls: Array<{ t: number; agent: string; name: string; hosts: string[] }> };
+      servedAtStart ??= seen.served;
+      if (seen.served > servedAtStart) correlator.noteModelHost("127.0.0.1");
+      for (const name of seen.blind_to) blindTo.add(name);
+      for (const call of seen.calls) {
+        lastActivity = Math.max(lastActivity, call.t);
+        correlator.noteDeclared(call.hosts);
+        recorder.write("tool_call", { harness: call.agent, name: call.name, hosts: call.hosts });
+      }
+    } catch {
+      // Judged on what is known; the final pass tries again.
+    }
+  };
+
+  const readModelRequest = async (request: Request, host: string, protocol: LlmProtocol, viaGateway: boolean) => {
     const harness = harnessFrom(request.headers.get("user-agent") ?? "");
     let body: any;
     try {
@@ -71,7 +103,7 @@ export async function run(options: RunOptions): Promise<number> {
     }
     if (toolResultIdsIn(protocol, body).some((id) => !seenCalls.has(id))) blindTo.add(harness);
     flush();
-    if (airs) {
+    if (airs && !viaGateway) {
       report(airs, guardEvent(runId, harness, protocol, body, airs.agentId))
         .then((verdict) => recorder.write("verdict", verdict))
         .catch((error) => recorder.write("verdict", { decision: "unjudged", findings: 0, error: String(error) }));
@@ -86,7 +118,7 @@ export async function run(options: RunOptions): Promise<number> {
     const protocol = classifyModelRequest(request.method, url.pathname);
     if (protocol) {
       correlator.noteModelHost(host);
-      void readModelRequest(request, host, protocol);
+      void readModelRequest(request, host, protocol, ownPort !== null && host === "127.0.0.1" && info?.target?.port === ownPort);
     } else {
       correlator.noteConnection(host, request.method, bytes, Date.now());
       recorder.write("request", { method: request.method, host, path: safePath(url.pathname), bytes });
@@ -95,7 +127,18 @@ export async function run(options: RunOptions): Promise<number> {
   };
 
   const config: SandboxRuntimeConfig = {
-    ...buildPolicy({ ...options, cwd: process.cwd() }),
+    ...buildPolicy({
+      cwd: process.cwd(),
+      allowHosts: [
+        ...options.allowHosts,
+        ...(settings.sandbox?.allowHosts ?? []),
+        ...(ownPort !== null ? [`127.0.0.1:${ownPort}`] : []),
+      ],
+      denyHosts: [...options.denyHosts, ...(settings.sandbox?.denyHosts ?? [])],
+      allowRead: [...options.allowRead, ...(settings.sandbox?.allowRead ?? [])],
+      allowWrite: [...options.allowWrite, ...(settings.sandbox?.allowWrite ?? [])],
+      allowLocalBinding: options.allowLocalBinding || settings.sandbox?.allowLocalBinding === true,
+    }),
   };
   config.network = { ...config.network, tlsTerminate: {}, filterRequest } as typeof config.network;
 
@@ -106,7 +149,9 @@ export async function run(options: RunOptions): Promise<number> {
   }
 
   const ask = async ({ host, port }: { host: string; port?: number | undefined }) => {
-    recorder.write("connect", { host, port, allowed: !options.enforce });
+    const local = isLocalTarget(host);
+    recorder.write("connect", { host, port, allowed: !options.enforce && !local });
+    if (local) return { allow: false as const, reason: `rontye: ${host} is this machine or a metadata endpoint. Allow it with --allow-host ${host}:${port}` };
     if (!options.enforce) return true;
     return { allow: false as const, reason: `rontye: ${host} is not allowed. Add it with --allow-host ${host}` };
   };
@@ -128,12 +173,16 @@ export async function run(options: RunOptions): Promise<number> {
   recorder.write("start", { mode: options.enforce ? "enforce" : "observe", command: options.command[0], run: runId });
   // sandbox-runtime exempts loopback and private ranges from the proxy, and those clients then fail
   // inside the sandbox. A local vLLM is what this tool exists to see, so everything goes through it.
-  const wrapped = await SandboxManager.wrapWithSandbox(`NO_PROXY= no_proxy= ${command}`, undefined, undefined, undefined, {
+  // NODE_USE_ENV_PROXY makes Node's own fetch honour the proxy; the pinned release does not set it.
+  let wrapped = await SandboxManager.wrapWithSandbox(`NO_PROXY= no_proxy= NODE_USE_ENV_PROXY=1 ${command}`, undefined, undefined, undefined, {
     commandId: runId,
     commandText: command,
   });
+  if (ownPort !== null && process.platform === "darwin") wrapped = openLoopbackPort(wrapped, ownPort);
   const child = spawn(wrapped, { shell: true, stdio: "inherit" });
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => child.kill(signal));
+  await syncGateway();
+  const syncTimer = setInterval(() => void syncGateway().then(() => flush()), 15_000);
   const code = await new Promise<number>((resolve) => {
     child.on("error", () => resolve(127));
     child.on("exit", (exitCode, signal) => resolve(exitCode ?? (signal ? 128 : 1)));
@@ -141,6 +190,8 @@ export async function run(options: RunOptions): Promise<number> {
 
   // The macOS violation monitor reads an asynchronous system log, and body reads may be in flight.
   await new Promise((resolve) => setTimeout(resolve, 1500));
+  clearInterval(syncTimer);
+  await syncGateway();
   flush(true);
   recorder.write("exit", { code });
   unsubscribe();

@@ -1,9 +1,10 @@
 /** Optional: send each model request to an OpenGuardrails runtime. Observe only; it decides nothing here. */
 import { randomBytes } from "node:crypto";
 import { userInfo } from "node:os";
+import { secretOf, type Config } from "./config.js";
 import type { LlmProtocol } from "./model.js";
 
-export const INTEGRATION = "rontye/0.1.0";
+export const INTEGRATION = "rontye/0.2.0";
 
 export interface AirsTarget {
   url: string;
@@ -11,12 +12,13 @@ export interface AirsTarget {
   agentId?: string;
 }
 
-export function airsFromEnv(env: NodeJS.ProcessEnv): AirsTarget | null {
-  if (!env.OGR_API_KEY) return null;
+export function airsTarget(config: Config): AirsTarget | null {
+  const apiKey = config.airs ? secretOf(config.airs) : undefined;
+  if (!config.airs || !apiKey) return null;
   return {
-    url: (env.OGR_RUNTIME_URL ?? "https://api.openguardrails.com").replace(/\/$/, ""),
-    apiKey: env.OGR_API_KEY,
-    ...(env.OGR_AGENT_ID ? { agentId: env.OGR_AGENT_ID } : {}),
+    url: config.airs.url.replace(/\/$/, ""),
+    apiKey,
+    ...(config.airs.agentId ? { agentId: config.airs.agentId } : {}),
   };
 }
 
