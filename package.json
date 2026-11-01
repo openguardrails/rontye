@@ -1,7 +1,7 @@
 {
   "name": "rontye",
-  "version": "0.1.0",
-  "description": "A firewall for the agents your agents spawn.",
+  "version": "0.3.0",
+  "description": "A local AI gateway, firewall and sandbox for your agents.",
   "license": "Apache-2.0",
   "type": "module",
   "repository": "github:openguardrails/rontye",
@@ -17,8 +17,9 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc",
-    "test": "tsc && node --test \"dist/test/*.test.js\""
+    "build": "tsc && chmod +x dist/src/cli.js",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "check:dist": "npm run build && git diff --exit-code -- dist/src"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.81"

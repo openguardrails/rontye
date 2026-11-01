@@ -1,27 +1,29 @@
 #!/usr/bin/env node
 import { latestRun, readRun, renderEvent } from "./record.js";
 import { run } from "./run.js";
+import { serve, status, stop } from "./serve.js";
 
-const USAGE = `rontye: a firewall for the agents your agents spawn
+const USAGE = `rontye: a local AI gateway, firewall and sandbox for your agents
 
-  rontye run [options] -- <command...>   run a command and everything it spawns inside the firewall
+  rontye run [options] -- <command...>   run a command and everything it spawns inside the sandbox
   rontye log [run-id]                    print what a run did (default: the latest)
+  rontye status                          check the gateway, every upstream and AIRS; exit 1 on a problem
+  rontye serve                           run the gateway in the foreground (\`run\` starts it for you)
+  rontye stop                            stop the gateway, for instance after editing the config
 
 run options:
   --enforce              deny every host not allowed, instead of recording it
-  --allow-host <host>    allow a host; an IP needs a port (--allow-host 127.0.0.1:8000)
+  --allow-host <host>    allow a host; an IP needs a port (--allow-host 10.0.0.5:8888)
   --deny-host <host>     deny a host in every mode
   --allow-read <path>    re-open a credential path that is denied by default
   --allow-write <path>   allow writes outside the project, temp and agent state directories
+  --allow-local-bind     let the command listen on a local port, for agents with a web UI
 
-environment:
-  OGR_API_KEY            send model requests to OpenGuardrails AIRS for judging (observe only)
-  OGR_RUNTIME_URL        the AIRS address
-  OGR_AGENT_ID           the agent id to report (default: the harness name)
+Configuration is ~/.rontye/config.json. See the README.
 `;
 
 function parseRun(args: string[]) {
-  const options = { enforce: false, allowHosts: [] as string[], denyHosts: [] as string[], allowRead: [] as string[], allowWrite: [] as string[], command: [] as string[] };
+  const options = { enforce: false, allowLocalBinding: false, allowHosts: [] as string[], denyHosts: [] as string[], allowRead: [] as string[], allowWrite: [] as string[], command: [] as string[] };
   const lists: Record<string, string[]> = {
     "--allow-host": options.allowHosts,
     "--deny-host": options.denyHosts,
@@ -38,6 +40,10 @@ function parseRun(args: string[]) {
       options.enforce = true;
       continue;
     }
+    if (arg === "--allow-local-bind") {
+      options.allowLocalBinding = true;
+      continue;
+    }
     const list = lists[arg];
     const value = args[i + 1];
     if (!list || value === undefined) throw new Error(`unknown or incomplete option: ${arg}`);
@@ -51,6 +57,9 @@ function parseRun(args: string[]) {
 async function main(argv: string[]): Promise<number> {
   const [verb, ...rest] = argv;
   if (verb === "run") return run(parseRun(rest));
+  if (verb === "serve") return serve();
+  if (verb === "status") return status();
+  if (verb === "stop") return stop();
   if (verb === "log") {
     const runId = rest[0] ?? latestRun();
     if (!runId) throw new Error("no runs recorded yet");
